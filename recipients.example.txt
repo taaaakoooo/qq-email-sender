@@ -1,0 +1,9 @@
+# 收件人列表示例：一行一个邮箱地址，每封邮件单独发送（互相看不到对方）。
+# 空行会被忽略；以 # 或 ; 开头的行是注释。
+# 复制本文件为 recipients.txt 后填入真实邮箱：
+#   copy recipients.example.txt recipients.txt
+#
+# 示例：
+# zhangsan@qq.com
+# lisi@163.com
+# wangwu@example.com

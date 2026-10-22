@@ -1,0 +1,40 @@
+# ===== 含隐私的本地配置与名单（切勿提交）=====
+config.ini
+recipients.txt
+failed_recipients.txt
+
+# 运行日志
+send_log.txt
+
+# 招新/成绩相关本地导出（学号、姓名、真实邮箱）
+通过*.txt
+其余人*.txt
+*邮箱*.txt
+*名单*.txt
+
+# 含真实 QQ / 招新信息的本地 HTML（仅保留示例 content.html）
+微光*.html
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时与备份
+*.tmp
+*.bak
+~$*
+*.xlsx
+*.xls
