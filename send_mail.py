@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""QQ 邮箱 HTML 邮件发送脚本（逐封独立发送）。
+"""QQ 邮箱 HTML 邮件发送脚本（一次登录，逐封单独发送）。
 
 功能：
     读取 config.ini 里的发件邮箱与授权码，读取一个 HTML 文件作为邮件正文，
-    再把 recipients.txt 里的收件人一个一个单独发送（每封邮件只有一位收件人）。
+    再把 recipients.txt 里的收件人一个一个单独发送（每封邮件只有一位收件人，
+    互不可见）。整批任务只登录 SMTP 一次，避免 QQ「登录频率限制」。
 
 用法：
     python send_mail.py                         # 使用同目录的 config.ini + recipients.txt
@@ -502,30 +503,36 @@ def diagnose(cfg: Config) -> int:
     return 3
 
 
-def send_one(cfg: Config, subject: str, html_text: str, to_addr: str) -> None:
-    """单独建立一次连接，只发给一位收件人。"""
-    message = build_message(cfg, subject, html_text, to_addr)
+def _close_server(server: smtplib.SMTP | None) -> None:
+    if server is None:
+        return
+    try:
+        server.quit()
+    except Exception:  # noqa: BLE001 - 关闭连接失败不影响结果
+        pass
+
+
+def open_session(cfg: Config) -> smtplib.SMTP:
+    """建立连接并登录一次，供整批发送复用。"""
     server = open_server(cfg)
     try:
         login(server, cfg)
-        server.send_message(message)
-    finally:
-        try:
-            server.quit()
-        except Exception:  # noqa: BLE001 - 关闭连接失败不影响结果
-            pass
+    except Exception:
+        _close_server(server)
+        raise
+    return server
+
+
+def deliver_one(server: smtplib.SMTP, cfg: Config, subject: str, html_text: str, to_addr: str) -> None:
+    """在已登录的会话上投递一封邮件（To 只有当前收件人）。"""
+    message = build_message(cfg, subject, html_text, to_addr)
+    server.send_message(message)
 
 
 def check_login(cfg: Config) -> None:
     """只验证能否连接并登录，不发送任何邮件。"""
-    server = open_server(cfg)
-    try:
-        login(server, cfg)
-    finally:
-        try:
-            server.quit()
-        except Exception:  # noqa: BLE001
-            pass
+    server = open_session(cfg)
+    _close_server(server)
 
 
 def _decode(value: object) -> str:
@@ -564,27 +571,94 @@ def friendly_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def send_with_retry(cfg: Config, subject: str, html_text: str, to_addr: str) -> tuple[bool, str, bool]:
-    """返回 (是否成功, 错误描述, 是否认证失败需中止整个任务)。"""
-    error = "未知错误"
-    for attempt in range(cfg.retry_times + 1):
-        if attempt > 0:
-            wait = cfg.retry_wait_seconds * attempt
-            say(f"\n    第 {attempt}/{cfg.retry_times} 次重试，等待 {wait:.0f} 秒 ...")
-            time.sleep(wait)
-        try:
-            send_one(cfg, subject, html_text, to_addr)
-            return True, "", False
-        except AuthFailed as exc:
-            # 授权码/服务未开启这类错误重试也没用，直接中止整批
-            return False, str(exc), True
-        except smtplib.SMTPAuthenticationError as exc:
-            return False, _auth_reply_message(exc.smtp_code, exc.smtp_error), True
-        except Exception as exc:  # noqa: BLE001 - 单封失败不应中断整体流程
-            error = friendly_error(exc)
-            if attempt < cfg.retry_times:
-                say(f"\n    第 {attempt + 1} 次尝试失败：{error}")
-    return False, error, False
+def send_campaign(
+    cfg: Config,
+    subject: str,
+    html_text: str,
+    recipients: list[str],
+) -> tuple[list[str], list[tuple[str, str]], bool]:
+    """一次登录，逐个收件人单独发送。
+
+    返回 (成功列表, [(失败地址, 原因), ...], 是否因认证失败中止)。
+    断线时会自动重连并重新登录后继续；认证失败则中止整批。
+    """
+    sent: list[str] = []
+    failed: list[tuple[str, str]] = []
+    aborted = False
+    total = len(recipients)
+    server: smtplib.SMTP | None = None
+
+    try:
+        say("正在连接并登录 SMTP（整批只登录一次）...")
+        server = open_session(cfg)
+        say("登录成功，开始逐封发送（每位收件人单独一封，互不可见）。")
+        say()
+
+        for index, addr in enumerate(recipients, 1):
+            print(f"[{index}/{total}] {addr} 发送中 ... ", end="", flush=True)
+            error = "未知错误"
+            ok = False
+
+            for attempt in range(cfg.retry_times + 1):
+                if attempt > 0:
+                    wait = cfg.retry_wait_seconds * attempt
+                    say(f"\n    第 {attempt}/{cfg.retry_times} 次重试，等待 {wait:.0f} 秒 ...")
+                    time.sleep(wait)
+                try:
+                    if server is None:
+                        server = open_session(cfg)
+                    deliver_one(server, cfg, subject, html_text, addr)
+                    ok = True
+                    break
+                except AuthFailed as exc:
+                    print(f"失败（{exc}）")
+                    failed.append((addr, str(exc)))
+                    write_log("FAIL", addr, str(exc))
+                    aborted = True
+                    say("\n授权码认证失败，继续发送只会重复报错，已中止本次任务。")
+                    # 把尚未处理的收件人也记入失败名单，方便续发
+                    for pending in recipients[index:]:
+                        failed.append((pending, "因认证失败未发送"))
+                        write_log("SKIP", pending, "因认证失败未发送")
+                    return sent, failed, aborted
+                except smtplib.SMTPAuthenticationError as exc:
+                    msg = _auth_reply_message(exc.smtp_code, exc.smtp_error)
+                    print(f"失败（{msg}）")
+                    failed.append((addr, msg))
+                    write_log("FAIL", addr, msg)
+                    aborted = True
+                    say("\n授权码认证失败，继续发送只会重复报错，已中止本次任务。")
+                    for pending in recipients[index:]:
+                        failed.append((pending, "因认证失败未发送"))
+                        write_log("SKIP", pending, "因认证失败未发送")
+                    return sent, failed, aborted
+                except smtplib.SMTPServerDisconnected as exc:
+                    error = friendly_error(exc)
+                    say(f"\n    连接已断开：{error}，准备重新登录后重试 ...")
+                    _close_server(server)
+                    server = None
+                    if attempt >= cfg.retry_times:
+                        break
+                except Exception as exc:  # noqa: BLE001 - 单封失败不应中断整体流程
+                    error = friendly_error(exc)
+                    if attempt < cfg.retry_times:
+                        say(f"\n    第 {attempt + 1} 次尝试失败：{error}")
+
+            if ok:
+                print("成功")
+                sent.append(addr)
+                write_log("OK", addr, subject)
+            else:
+                print(f"失败（{error}）")
+                failed.append((addr, error))
+                write_log("FAIL", addr, error)
+
+            if index < total:
+                time.sleep(cfg.delay_seconds)
+    finally:
+        _close_server(server)
+
+    return sent, failed, aborted
 
 
 # --------------------------------------------------------------------------- #
@@ -665,7 +739,8 @@ def main(argv: list[str] | None = None) -> int:
     say(f"HTML 正文：{cfg.html_file}")
     say(f"收件人数：{len(recipients)}")
     say(f"发送间隔：{cfg.delay_seconds:g} 秒/封，失败重试 {cfg.retry_times} 次")
-    say(f"总计：每封单独发送，共 {len(recipients)} 封邮件")
+    say(f"登录方式：整批只登录一次，逐封单独发送（收件人互不可见）")
+    say(f"总计：共 {len(recipients)} 封邮件")
     say("=" * 62)
 
     if args.dry_run:
@@ -686,28 +761,15 @@ def main(argv: list[str] | None = None) -> int:
         say()
 
     send_start = time.time()
-    sent: list[str] = []
-    failed: list[tuple[str, str]] = []
-    aborted = False
     total = len(recipients)
-
-    for index, addr in enumerate(recipients, 1):
-        print(f"[{index}/{total}] {addr} 发送中 ... ", end="", flush=True)
-        ok, error, auth_failed = send_with_retry(cfg, subject, html_text, addr)
-        if ok:
-            print("成功")
-            sent.append(addr)
-            write_log("OK", addr, subject)
-        else:
-            print(f"失败（{error}）")
-            failed.append((addr, error))
-            write_log("FAIL", addr, error)
-            if auth_failed:
-                aborted = True
-                say("\n授权码认证失败，继续发送只会重复报错，已中止本次任务。")
-                break
-        if index < total:
-            time.sleep(cfg.delay_seconds)
+    try:
+        sent, failed, aborted = send_campaign(cfg, subject, html_text, recipients)
+    except AuthFailed as exc:
+        say(f"登录失败：{exc}")
+        return 3
+    except Exception as exc:  # noqa: BLE001
+        say(f"连接失败：{friendly_error(exc)}")
+        return 3
 
     elapsed = time.time() - send_start
     say()
